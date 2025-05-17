@@ -76,7 +76,7 @@ from transformers import TrainingArguments, Trainer, IntervalStrategy
 training_args = TrainingArguments(
     output_dir="./intent_model",       # output directory for model checkpoints and logs
     overwrite_output_dir=False,
-    num_train_epochs=30,                # let's fine-tune for 3 epochs (adjustable)
+    num_train_epochs=10,                # let's fine-tune for 3 epochs (adjustable)
     per_device_train_batch_size=32,    # batch size for training
     per_device_eval_batch_size=32,     # batch size for evaluation
     learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
@@ -122,68 +122,98 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# 1️⃣ Utility functions to compute scores
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics import roc_curve, confusion_matrix
+import matplotlib.pyplot as plt
+
 def max_softmax_prob(logits: torch.Tensor, T: float = 1.0) -> float:
-    """
-    Returns the maximum softmax probability from `logits / T`.
-    """
-    scaled = logits / T
-    probs = F.softmax(scaled, dim=-1)
+    probs = F.softmax(logits / T, dim=-1)
     return float(probs.max())
 
 def energy_score(logits: torch.Tensor, T: float = 1.0) -> float:
-    """
-    Energy score: -T * logsumexp(logits / T)
-    Higher values → more likely OOD.
-    """
     return float(-T * torch.logsumexp(logits / T, dim=-1))
 
+def calibrate_oos_thresholds_roc(
+    trainer,
+    val_dataset,
+    oos_label_name: str = "oos:oos",
+    T: float = 1.0,
+    plot: bool = False
+):
+    # 1. Gather logits & labels
+    pred_output = trainer.predict(val_dataset)
+    logits_np   = pred_output.predictions    # (N, num_labels)
+    labels_np   = pred_output.label_ids      # (N,)
 
-# 2️⃣ Calibrate thresholds on your validation set
-#    We’ll run the model on val_dataset, collect (max_prob, energy) for both in-scope and oos labels,
-#    then pick thresholds that best separate them (e.g. midpoint between distributions).
+    # 2. Identify OOS ID
+    label2id = trainer.model.config.label2id
+    if oos_label_name not in label2id:
+        raise ValueError(f"Label '{oos_label_name}' not found.")
+    oos_id = label2id[oos_label_name]
 
-# 2a. Predict on val split
-val_out = trainer.predict(val_dataset)
-val_logits = torch.from_numpy(val_out.predictions)   # shape (N_val, num_labels)
-val_labels = val_out.label_ids                       # shape (N_val,)
+    # 3. Compute scores & ground-truth
+    max_probs = []
+    energies  = []
+    is_oos    = []
+    for logit_vec, lbl in zip(torch.tensor(logits_np), labels_np):
+        max_probs.append(max_softmax_prob(logit_vec, T))
+        energies.append(energy_score(logit_vec, T))
+        is_oos.append(int(lbl) == oos_id)
 
-# 2b. Identify your OOS label ID
-#     (assuming your OOS intent was named exactly "oos" in the original label list)
-oos_id = model.config.label2id.get("oos:oos", None)
-if oos_id is None:
-    raise ValueError("Could not find 'oos' label in model.config.label2id")
+    max_probs = np.array(max_probs)
+    energies  = np.array(energies)
+    is_oos    = np.array(is_oos, dtype=bool)
 
-# 2c. Compute scores for each example
-max_probs = []
-energies  = []
-is_oos    = []
+    # Optional: visualize
+    if plot:
+        plt.hist(max_probs[~is_oos], bins=50, alpha=0.5, label="in-scope")
+        plt.hist(max_probs[is_oos],  bins=50, alpha=0.5, label="OOS")
+        plt.title("Softmax Max-Prob Distributions"); plt.legend(); plt.show()
 
-for logit, lbl in zip(val_logits, val_labels):
-    max_probs.append(max_softmax_prob(logit))
-    energies.append(energy_score(logit))
-    is_oos.append(lbl == oos_id)
+        plt.hist(energies[~is_oos], bins=50, alpha=0.5, label="in-scope")
+        plt.hist(energies[is_oos],  bins=50, alpha=0.5, label="OOS")
+        plt.title("Energy Score Distributions"); plt.legend(); plt.show()
 
-max_probs = np.array(max_probs)
-energies  = np.array(energies)
-is_oos    = np.array(is_oos)
+    # 4. Find best softmax-prob threshold via Youden’s J
+    #    We invert max_probs so that higher “score” => more likely OOS
+    fpr_p, tpr_p, thr_p = roc_curve(is_oos, -max_probs)
+    j_scores_p = tpr_p - fpr_p
+    best_idx_p = np.argmax(j_scores_p)
+    tau_prob   = thr_p[best_idx_p]
 
-# 2d. Choose thresholds
-#    e.g. threshold_prob = midpoint between
-#      median(max_probs[~is_oos]) and median(max_probs[is_oos])
-#    similarly for energy.
-th_prob = 0.5 * (np.median(max_probs[~is_oos]) + np.median(max_probs[is_oos]))
-th_energy = 0.5 * (np.median(energies[~is_oos]) + np.median(energies[is_oos]))
+    # 5. Find best energy threshold via Youden’s J
+    fpr_e, tpr_e, thr_e = roc_curve(is_oos, energies)
+    j_scores_e = tpr_e - fpr_e
+    best_idx_e = np.argmax(j_scores_e)
+    tau_energy = thr_e[best_idx_e]
 
-print(f"Calibrated softmax‐prob threshold: {th_prob:.3f}")
-print(f"Calibrated energy threshold:       {th_energy:.3f}")
+    print(f"→ Softmax-prob τₚ = {tau_prob:.4f} (J={j_scores_p[best_idx_p]:.3f})")
+    print(f"→ Energy τ_E        = {tau_energy:.3f} (J={j_scores_e[best_idx_e]:.3f})")
+
+    # 6. Evaluate combined detector
+    preds_oos = (max_probs < tau_prob) | (energies > tau_energy)
+    tn, fp, fn, tp = confusion_matrix(is_oos, preds_oos).ravel()
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec  = tp / (tp + fn) if tp + fn else 0.0
+    f1   = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+
+    print("Combined Detector — Confusion Matrix:")
+    print(f"    True In-Scope   as In-Scope:  TN={tn}")
+    print(f"    True In-Scope   as OOS:       FP={fp}")
+    print(f"    True OOS        as In-Scope:  FN={fn}")
+    print(f"    True OOS        as OOS:       TP={tp}")
+    print(f"Precision={prec:.3f}, Recall={rec:.3f}, F1={f1:.3f}")
+
+    return tau_prob, tau_energy
 
 
 # 3️⃣ Augmented inference function with OOS/OOD detection
 def predict_intent_with_oos(
     text: str,
-    tau_prob: float = th_prob,
-    tau_energy: float = th_energy,
+    tau_prob: float,
+    tau_energy: float,
     T: float = 1.0
 ) -> dict:
     """
@@ -212,6 +242,16 @@ def predict_intent_with_oos(
 
     return {"intent": intent, "confidence": p, "energy": e}
 
+# ─── Usage ────────────────────────────────────────────────────────────────────
+# After you have trained your model and have a Trainer instance:
+
+tau_prob, tau_energy = calibrate_oos_thresholds_roc(
+    trainer,
+    val_dataset,
+    oos_label_name="oos:oos",
+    T=1.0,
+    plot=True       # toggle to see the histograms
+)
 
 # Interactive loop for intent prediction
 while True:
@@ -219,7 +259,9 @@ while True:
     if example_query.lower() == "exit":
         print("Exiting...")
         break
-    pred_intent = predict_intent_with_oos(example_query)
+    # The following number were chose by analyzing the ROC curve and the energy score distributions
+    # pred_intent = predict_intent_with_oos(example_query, 0.42, -6.5, 1.1)
+    pred_intent = predict_intent_with_oos(example_query, tau_prob, tau_energy, 1.1)
     print(f"Query: '{example_query}'")
     print(f"Predicted Intent: {pred_intent}")
 
