@@ -76,7 +76,7 @@ from transformers import TrainingArguments, Trainer, IntervalStrategy
 training_args = TrainingArguments(
     output_dir="./intent_model",       # output directory for model checkpoints and logs
     overwrite_output_dir=False,
-    num_train_epochs=5,                # let's fine-tune for 3 epochs (adjustable)
+    num_train_epochs=30,                # let's fine-tune for 3 epochs (adjustable)
     per_device_train_batch_size=32,    # batch size for training
     per_device_eval_batch_size=32,     # batch size for evaluation
     learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
@@ -144,3 +144,18 @@ while True:
     print(f"Query: '{example_query}'")
     print(f"Predicted Intent: {pred_intent}")
 
+# Enter a query (or type 'exit' to quit): I want to travel to india
+# Query: 'I want to travel to india'
+# Predicted Intent: travel:international_visa
+# Enter a query (or type 'exit' to quit): Book me an appointment with the dentist
+# Query: 'Book me an appointment with the dentist'
+# Predicted Intent: auto_and_commute:schedule_maintenance
+# Enter a query (or type 'exit' to quit): Book me an appointment with the dentist
+# Query: 'Book me an appointment with the dentist'
+# Predicted Intent: auto_and_commute:schedule_maintenance
+# Enter a query (or type 'exit' to quit): My son has been become dangerously sick. I need to tend to him for the next week and be away from work.
+# Query: 'My son has been become dangerously sick. I need to tend to him for the next week and be away from work.'
+# Predicted Intent: work:pto_used
+# Enter a query (or type 'exit' to quit): My son has been become dangerously sick. I need time off.
+# Query: 'My son has been become dangerously sick. I need time off.'
+# Predicted Intent: work:pto_request_status
