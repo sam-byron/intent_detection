@@ -2,12 +2,20 @@
 import random
 import nltk
 from nltk.corpus import wordnet
-from datasets import Dataset
+import torch
+from datasets import Dataset, disable_caching
 from transformers import (
-    MarianMTModel, MarianTokenizer,
+    MarianMTModel, MarianTokenizer, AutoTokenizer,
     pipeline as hf_pipeline,
-    AutoTokenizer
 )
+import os
+from datasets import concatenate_datasets
+import multiprocessing
+from multiprocessing import Pool, cpu_count
+import torch.distributed as dist
+
+# Disable datasets caching
+disable_caching()
 
 # ─── 1. SYNONYM REPLACEMENT ────────────────────────────────────────────────────
 nltk.download('wordnet')
@@ -19,6 +27,8 @@ def synonym_replacement(sentence: str, n: int = 2) -> str:
     """
     words = sentence.split()
     candidates = [w for w in words if wordnet.synsets(w)]
+    if not candidates:
+        return sentence  # Return the original sentence if no synonyms are found
     random.shuffle(candidates)
     num_repl = 0
     new_words = words.copy()
@@ -39,22 +49,26 @@ def synonym_replacement(sentence: str, n: int = 2) -> str:
 
 
 # ─── 2. BACK-TRANSLATION ───────────────────────────────────────────────────────
-# Load English→Spanish and Spanish→English models once
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# Use MarianMT models for translation
 mt_en_es_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-es")
-mt_en_es_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-es")
+mt_en_es_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-es").to(device)
 mt_es_en_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-es-en")
-mt_es_en_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en")
+mt_es_en_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en").to(device)
 
 def back_translate(text: str) -> str:
     # English → Spanish
-    batch = mt_en_es_tokenizer([text], return_tensors="pt", truncation=True, max_length=128)
-    translated = mt_en_es_model.generate(**batch, num_beams=5, max_length=128)
+    batch = mt_en_es_tokenizer([text], return_tensors="pt", truncation=True, max_length=64)
+    batch = {k: v.to(device) for k, v in batch.items()}
+    with torch.no_grad():
+        translated = mt_en_es_model.generate(**batch, num_beams=1, max_length=64)
     es = mt_en_es_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
     # Spanish → English
-    batch_rev = mt_es_en_tokenizer([es], return_tensors="pt", truncation=True, max_length=128)
-    back = mt_es_en_model.generate(**batch_rev, num_beams=5, max_length=128)
+    batch_rev = mt_es_en_tokenizer([es], return_tensors="pt", truncation=True, max_length=64)
+    batch_rev = {k: v.to(device) for k, v in batch_rev.items()}
+    with torch.no_grad():
+        back = mt_es_en_model.generate(**batch_rev, num_beams=1, max_length=64)
     return mt_es_en_tokenizer.batch_decode(back, skip_special_tokens=True)[0]
-
 
 # ─── 3. PROMPT-BASED SYNTHETIC GENERATION ───────────────────────────────────────
 # Here we use a small GPT-style model for demonstration; swap in a larger LLM if you like.
@@ -98,78 +112,49 @@ def generate_synthetic_for_intent(intent_label: str, k: int = 5) -> list[str]:
 # This should match the model you will use for training.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-def augment_dataset(train_ds, num_syn_repl=1, num_bt=1, num_synth=3):
-    """
-    Given a HuggingFace Dataset `train_ds` with fields ["text","labels","input_ids",...],
-    return an augmented Dataset.
-    """
-    # 1) Collect original examples
-    print("Collecting original examples...")
-    orig_dict = {k: train_ds[k] for k in train_ds.column_names}
-    print(f"Original dataset columns: {list(orig_dict.keys())}")
-    print(f"Number of original examples: {len(orig_dict['text'])}")
 
-    # 2) Build lists for augmented samples
-    aug_texts  = []
-    aug_labels = []
+def augment_dataset(batch, num_syn_repl=1, num_bt=1):
+    augmented_texts = []
+    augmented_labels = []
+    # We assume the original batch still has a "text" field.
+    for text, label in zip(batch["text"], batch["labels"]):
+        # Apply synonym replacement
+        aug_text = synonym_replacement(text, n=num_syn_repl)
+        # Optionally apply back-translation (uncomment the next two lines if desired)
+        bt_text = back_translate(text)
+        # aug_text = bt_text  # choose which augmentation to keep
+        augmented_texts.append(aug_text)
+        augmented_labels.append(label)
+        augmented_texts.append(bt_text)
+        augmented_labels.append(label)
+    # Return with the same keys as expected by the tokenizer later
+    return {"text": augmented_texts, "labels": augmented_labels}
 
-    for text, label in zip(orig_dict["text"], orig_dict["labels"]):
-        print(f"Processing text: {text}, label: {label}")
-        # synonym replacements
-        for _ in range(num_syn_repl):
-            augmented_text = synonym_replacement(text)
-            print(f"Synonym replacement: {augmented_text}")
-            aug_texts.append(augmented_text)
-            aug_labels.append(label)
-        # back-translations
-        # for _ in range(num_bt):
-        #     augmented_text = back_translate(text)
-        #     print(f"Back-translated text: {augmented_text}")
-        #     aug_texts.append(augmented_text)
-        #     aug_labels.append(label)
+def tokenize_batch(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=64)
 
-    # 3) Synthetic per-intent generation
-    # print("Generating synthetic examples per intent...")
-    # unique_labels = set(aug_labels)
-    # print(f"Unique labels: {unique_labels}")
-    # for lbl in unique_labels:
-    #     intent_name = train_ds.features["labels"].int2str(lbl)
-    #     print(f"Generating synthetic examples for intent: {intent_name}")
-    #     synths = generate_synthetic_for_intent(intent_name, k=num_synth)
-    #     for s in synths:
-    #         print(f"Synthetic example: {s}")
-    #         aug_texts.append(s)
-    #         aug_labels.append(lbl)
-
-    # 4) Create a new Dataset
-    print("Creating augmented dataset...")
-    aug_ds = Dataset.from_dict({"text": aug_texts, "labels": aug_labels})
-
-    # Align the feature type of the 'labels' column with the original dataset
-    aug_ds = aug_ds.cast_column("labels", train_ds.features["labels"])
-    print(f"Number of augmented examples: {len(aug_ds)}")
-
-    # 5) Concatenate & re-tokenize
-    from datasets import concatenate_datasets
-    print("Concatenating original and augmented datasets...")
-    combined = concatenate_datasets([train_ds, aug_ds])
-    print(f"Total number of examples after concatenation: {len(combined)}")
-
-    print("Re-tokenizing combined dataset...")
-    combined = combined.map(
-        lambda ex: tokenizer(
-            ex["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=64
-        ),
-        batched=True
+def save_augmented_dataset(train_ds, num_syn_repl=1, num_bt=1, num_synth=3, output_path="./augmented_dataset"):
+    # Here we perform augmentation by mapping over the training dataset
+    augmented_ds = train_ds.map(
+        lambda batch: augment_dataset(batch, num_syn_repl=num_syn_repl, num_bt=num_bt),
+        batched=True,
+        batch_size=512,  # Specify the batch size here
+        remove_columns=train_ds.column_names  # remove old columns if necessary
     )
+    # Now tokenize the augmented text so that we get 'input_ids', 'attention_mask', etc.
+    augmented_ds = augmented_ds.map(tokenize_batch, batched=True, batch_size=512)
+    augmented_ds.set_format("torch")
+     # Concatenate augmented_ds with the original dataset.
+    combined_ds = concatenate_datasets([train_ds, augmented_ds])
+    
+    # Save the augmented dataset to disk
+    os.makedirs(output_path, exist_ok=True)
+    print("Saving augmented dataset to file...")
+    combined_ds.save_to_disk(output_path)
+    return combined_ds
+   
 
-    # Drop old columns if necessary
-    print("Removing unnecessary columns...")
-    combined = combined.remove_columns(["text"])  # keep only input_ids, attention_mask, labels
-    combined.set_format("torch")
-    print("Augmentation complete. Returning augmented dataset.")
-    return combined
+if __name__ == '__main__':
+    dist.init_process_group(backend="nccl")
+    multiprocessing.set_start_method("spawn", force=True)
 

@@ -8,6 +8,7 @@ matplotlib
 nltk
 sentencepiece
 sacremoses
+protobuf
 
 # For RTX 5000 series GPUs support, pytorch was compiled from source.
 # https://stackoverflow.com/questions/73317676/importerror-usr-lib-aarch64-linux-gnu-libstdc-so-6-version-glibcxx-3-4-30

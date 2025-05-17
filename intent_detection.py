@@ -1,9 +1,9 @@
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import os
 from transformers.trainer_utils import get_last_checkpoint
-from augmentation import augment_dataset
+from augmentation import save_augmented_dataset
 
 # Load the CLINC150 dataset from Hugging Face (this will download the data_full version)
 # The clinc_data object is a DatasetDict or Dataset containing all 23,700 samples in CLINC150. The dataset includes a column for the user utterance text, an intent label (e.g. "banking:balance"), a broader domain label, and a split indicator. The data is divided into training, validation, and test splits, with out-of-scope examples separated as well (e.g., "oos_train", "oos_test" for out-of-scope queries). 
@@ -46,13 +46,21 @@ val_dataset   = val_dataset.rename_column("intent", "labels")
 test_dataset  = test_dataset.rename_column("intent", "labels")
 
 print("Preparing augmented dataset...")
-augmented_train = augment_dataset(train_dataset,
-                                  num_syn_repl=1,
-                                  num_bt=1,
-                                  num_synth=3)
+augmented_dataset_path = "./augmented_train_dataset"
+
+if os.path.exists(augmented_dataset_path):
+    print("Loading augmented dataset from file...")
+    augmented_train = load_from_disk(augmented_dataset_path)
+else:
+    print("Augmenting dataset...")
+    augmented_train = save_augmented_dataset(train_dataset,
+                                      num_syn_repl=1,
+                                      num_bt=1,
+                                      num_synth=3,
+                                      output_path=augmented_dataset_path)
 # The augment_dataset function will return a new dataset with augmented samples
 # Print the number of samples in the augmented training set
-print(f"Augmented Train samples: {len(augmented_train)}")  # Expect ~15100 original
+print(f"Augmented Train samples: {len(augmented_train)}")
 
 # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
 train_dataset = train_dataset.remove_columns(["text", "domain", "split"])
@@ -87,7 +95,7 @@ from transformers import TrainingArguments, Trainer, IntervalStrategy
 training_args = TrainingArguments(
     output_dir="./intent_model",       # output directory for model checkpoints and logs
     overwrite_output_dir=False,
-    num_train_epochs=5,                # let's fine-tune for 3 epochs (adjustable)
+    num_train_epochs=3,                # let's fine-tune for 3 epochs (adjustable)
     per_device_train_batch_size=32,    # batch size for training
     per_device_eval_batch_size=32,     # batch size for evaluation
     learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
