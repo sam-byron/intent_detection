@@ -134,9 +134,13 @@ def predict_intent(text: str) -> str:
     predicted_intent = label_names[predicted_label_id]
     return predicted_intent
 
-# Example usage:
-example_query = "I lost my credit card and need a replacement."
-pred_intent = predict_intent(example_query)
-print(f"Query: '{example_query}'")
-print(f"Predicted Intent: {pred_intent}")
+# Interactive loop for intent prediction
+while True:
+    example_query = input("Enter a query (or type 'exit' to quit): ")
+    if example_query.lower() == "exit":
+        print("Exiting...")
+        break
+    pred_intent = predict_intent(example_query)
+    print(f"Query: '{example_query}'")
+    print(f"Predicted Intent: {pred_intent}")
 
