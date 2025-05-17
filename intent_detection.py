@@ -1,0 +1,110 @@
+import torch
+from datasets import load_dataset
+
+# Load the CLINC150 dataset from Hugging Face (this will download the data_full version)
+# The clinc_data object is a DatasetDict or Dataset containing all 23,700 samples in CLINC150. The dataset includes a column for the user utterance text, an intent label (e.g. "banking:balance"), a broader domain label, and a split indicator. The data is divided into training, validation, and test splits, with out-of-scope examples separated as well (e.g., "oos_train", "oos_test" for out-of-scope queries). 
+clinc_data = load_dataset("contemmcm/clinc150", "full")
+print(clinc_data)
+
+# The dataset might be stored under a single split "complete", so we filter by the 'split' field:
+if "complete" in clinc_data:
+    full_dataset = clinc_data["complete"]       # All data
+else:
+    full_dataset = clinc_data                  # Handle case where directly a Dataset is returned
+
+# Separate into training, validation, and test sets, including out-of-scope (oos) examples
+train_dataset = full_dataset.filter(lambda ex: ex["split"] in ["train", "oos_train"])
+val_dataset   = full_dataset.filter(lambda ex: ex["split"] in ["val", "oos_val"])
+test_dataset  = full_dataset.filter(lambda ex: ex["split"] in ["test", "oos_test"])
+
+print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
+# Expect ~15100 train (15000 in-scope + 100 oos), 3100 val (3000 + 100), 5500 test (4500 + 1000)
+
+
+from transformers import AutoTokenizer
+
+# Initialize BERT tokenizer (uncased means text will be lowercased)
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# Tokenization function to process text examples
+def tokenize_batch(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=64)
+    # max_length=64 should cover most queries; adjust if needed (max utterance length in CLINC150 is relatively short)
+
+# Apply tokenization to each split of the dataset
+train_dataset = train_dataset.map(tokenize_batch, batched=True)
+val_dataset   = val_dataset.map(tokenize_batch, batched=True)
+test_dataset  = test_dataset.map(tokenize_batch, batched=True)
+
+# Rename the intent column to 'labels' for compatibility with the model training API
+train_dataset = train_dataset.rename_column("intent", "labels")
+val_dataset   = val_dataset.rename_column("intent", "labels")
+test_dataset  = test_dataset.rename_column("intent", "labels")
+
+# We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
+train_dataset = train_dataset.remove_columns(["text", "domain", "split"])
+val_dataset   = val_dataset.remove_columns(["text", "domain", "split"])
+test_dataset  = test_dataset.remove_columns(["text", "domain", "split"])
+
+# Set formats for PyTorch (so that __getitem__ returns torch.Tensor)
+train_dataset.set_format("torch")
+val_dataset.set_format("torch")
+test_dataset.set_format("torch")
+
+
+# Get the list of intent label names (for later use in decoding predictions)
+label_names = full_dataset.features["intent"].names  # list of 151 intent labels (e.g., "banking:balance", "oos:oos", etc.)
+print(label_names)
+
+from transformers import AutoModelForSequenceClassification
+
+num_intents = len(label_names)  # should be 151 for CLINC150 full
+model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=num_intents)
+
+# Set model's label mappings (useful for inference or saving the model)
+model.config.id2label = {i: label for i, label in enumerate(label_names)}
+model.config.label2id = {label: i for i, label in enumerate(label_names)}
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+
+from transformers import TrainingArguments, Trainer, IntervalStrategy
+
+training_args = TrainingArguments(
+    output_dir="./intent_model",       # output directory for model checkpoints and logs
+    overwrite_output_dir=True,
+    num_train_epochs=6,                # let's fine-tune for 3 epochs (adjustable)
+    per_device_train_batch_size=32,    # batch size for training
+    per_device_eval_batch_size=32,     # batch size for evaluation
+    learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
+    eval_strategy="epoch",       # evaluate on the validation set each epoch
+    # evaluate_during_training=True,    # evaluate during training
+    save_strategy="epoch",             # save model each epoch
+    load_best_model_at_end=True,       # load best model (according to eval metric) at end of training
+    metric_for_best_model="accuracy",  # use accuracy to pick best model (could use f1 as well)
+    logging_steps=50,                  # log training progress every 50 steps
+    logging_dir="./logs",              # directory for logs
+    seed=42                            # for reproducibility
+)
+
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=1)
+    acc = accuracy_score(labels, predictions)
+    f1 = f1_score(labels, predictions, average="weighted")
+    return {"accuracy": acc, "f1": f1}
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,             # validation set for evaluation
+    tokenizer=tokenizer,                  # tokenizer is passed to enable automatic padding in the collator
+    compute_metrics=compute_metrics       # function to compute metrics
+)
+
+trainer.train()
