@@ -118,21 +118,100 @@ test_metrics = trainer.evaluate(test_dataset)
 print("Test Set Performance:", test_metrics)
 
 
-def predict_intent(text: str) -> str:
-    # Prepare the input for the model
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+# 1️⃣ Utility functions to compute scores
+def max_softmax_prob(logits: torch.Tensor, T: float = 1.0) -> float:
+    """
+    Returns the maximum softmax probability from `logits / T`.
+    """
+    scaled = logits / T
+    probs = F.softmax(scaled, dim=-1)
+    return float(probs.max())
+
+def energy_score(logits: torch.Tensor, T: float = 1.0) -> float:
+    """
+    Energy score: -T * logsumexp(logits / T)
+    Higher values → more likely OOD.
+    """
+    return float(-T * torch.logsumexp(logits / T, dim=-1))
+
+
+# 2️⃣ Calibrate thresholds on your validation set
+#    We’ll run the model on val_dataset, collect (max_prob, energy) for both in-scope and oos labels,
+#    then pick thresholds that best separate them (e.g. midpoint between distributions).
+
+# 2a. Predict on val split
+val_out = trainer.predict(val_dataset)
+val_logits = torch.from_numpy(val_out.predictions)   # shape (N_val, num_labels)
+val_labels = val_out.label_ids                       # shape (N_val,)
+
+# 2b. Identify your OOS label ID
+#     (assuming your OOS intent was named exactly "oos" in the original label list)
+oos_id = model.config.label2id.get("oos:oos", None)
+if oos_id is None:
+    raise ValueError("Could not find 'oos' label in model.config.label2id")
+
+# 2c. Compute scores for each example
+max_probs = []
+energies  = []
+is_oos    = []
+
+for logit, lbl in zip(val_logits, val_labels):
+    max_probs.append(max_softmax_prob(logit))
+    energies.append(energy_score(logit))
+    is_oos.append(lbl == oos_id)
+
+max_probs = np.array(max_probs)
+energies  = np.array(energies)
+is_oos    = np.array(is_oos)
+
+# 2d. Choose thresholds
+#    e.g. threshold_prob = midpoint between
+#      median(max_probs[~is_oos]) and median(max_probs[is_oos])
+#    similarly for energy.
+th_prob = 0.5 * (np.median(max_probs[~is_oos]) + np.median(max_probs[is_oos]))
+th_energy = 0.5 * (np.median(energies[~is_oos]) + np.median(energies[is_oos]))
+
+print(f"Calibrated softmax‐prob threshold: {th_prob:.3f}")
+print(f"Calibrated energy threshold:       {th_energy:.3f}")
+
+
+# 3️⃣ Augmented inference function with OOS/OOD detection
+def predict_intent_with_oos(
+    text: str,
+    tau_prob: float = th_prob,
+    tau_energy: float = th_energy,
+    T: float = 1.0
+) -> dict:
+    """
+    Tokenize `text`, run the model, and:
+      - compute max softmax prob & energy,
+      - if either indicates OOD, return 'oos',
+      - otherwise return the predicted in-scope intent.
+    Returns a dict with:
+      * intent: str
+      * confidence: max softmax prob
+      * energy: float
+    """
     inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-    inputs.to(device)  # Move inputs to the same device as the model
-    # Ensure model is in eval mode and on the right device
     model.eval()
-    # If using GPU, uncomment the next line to move inputs to CUDA
-    # inputs = {k: v.to("cuda") for k, v in inputs.items()}
     with torch.no_grad():
-        outputs = model(**inputs)
-    logits = outputs.logits
-    predicted_label_id = int(logits.argmax(dim=1))
-    # Map the predicted label ID to the label name
-    predicted_intent = label_names[predicted_label_id]
-    return predicted_intent
+        inputs.to(device)  # Move inputs to the same device as the model
+        logits = model(**inputs).logits[0]
+
+    p   = max_softmax_prob(logits, T)
+    e   = energy_score(logits, T)
+    pred_id = int(logits.argmax().item())
+    intent = model.config.id2label[pred_id]
+
+    if p < tau_prob or e > tau_energy:
+        return {"intent": "oos", "confidence": p, "energy": e}
+
+    return {"intent": intent, "confidence": p, "energy": e}
+
 
 # Interactive loop for intent prediction
 while True:
@@ -140,7 +219,7 @@ while True:
     if example_query.lower() == "exit":
         print("Exiting...")
         break
-    pred_intent = predict_intent(example_query)
+    pred_intent = predict_intent_with_oos(example_query)
     print(f"Query: '{example_query}'")
     print(f"Predicted Intent: {pred_intent}")
 
