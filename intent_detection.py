@@ -1,5 +1,7 @@
 import torch
 from datasets import load_dataset
+import os
+from transformers.trainer_utils import get_last_checkpoint
 
 # Load the CLINC150 dataset from Hugging Face (this will download the data_full version)
 # The clinc_data object is a DatasetDict or Dataset containing all 23,700 samples in CLINC150. The dataset includes a column for the user utterance text, an intent label (e.g. "banking:balance"), a broader domain label, and a split indicator. The data is divided into training, validation, and test splits, with out-of-scope examples separated as well (e.g., "oos_train", "oos_test" for out-of-scope queries). 
@@ -73,8 +75,8 @@ from transformers import TrainingArguments, Trainer, IntervalStrategy
 
 training_args = TrainingArguments(
     output_dir="./intent_model",       # output directory for model checkpoints and logs
-    overwrite_output_dir=True,
-    num_train_epochs=6,                # let's fine-tune for 3 epochs (adjustable)
+    overwrite_output_dir=False,
+    num_train_epochs=5,                # let's fine-tune for 3 epochs (adjustable)
     per_device_train_batch_size=32,    # batch size for training
     per_device_eval_batch_size=32,     # batch size for evaluation
     learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
@@ -85,7 +87,7 @@ training_args = TrainingArguments(
     metric_for_best_model="accuracy",  # use accuracy to pick best model (could use f1 as well)
     logging_steps=50,                  # log training progress every 50 steps
     logging_dir="./logs",              # directory for logs
-    seed=42                            # for reproducibility
+    seed=42,                            # for reproducibility
 )
 
 import numpy as np
@@ -107,4 +109,34 @@ trainer = Trainer(
     compute_metrics=compute_metrics       # function to compute metrics
 )
 
-trainer.train()
+trainer.train(get_last_checkpoint(training_args.output_dir))  # start training
+# Save the fine-tuned model
+# trainer.save_model("./intent_model")  # save the model to the specified directory
+
+# Evaluate the fine-tuned model on the test set
+test_metrics = trainer.evaluate(test_dataset)
+print("Test Set Performance:", test_metrics)
+
+
+def predict_intent(text: str) -> str:
+    # Prepare the input for the model
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    inputs.to(device)  # Move inputs to the same device as the model
+    # Ensure model is in eval mode and on the right device
+    model.eval()
+    # If using GPU, uncomment the next line to move inputs to CUDA
+    # inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+    logits = outputs.logits
+    predicted_label_id = int(logits.argmax(dim=1))
+    # Map the predicted label ID to the label name
+    predicted_intent = label_names[predicted_label_id]
+    return predicted_intent
+
+# Example usage:
+example_query = "I lost my credit card and need a replacement."
+pred_intent = predict_intent(example_query)
+print(f"Query: '{example_query}'")
+print(f"Predicted Intent: {pred_intent}")
+
