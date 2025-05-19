@@ -3,7 +3,7 @@ import random
 import nltk
 from nltk.corpus import wordnet
 import torch
-from datasets import Dataset, disable_caching, load_dataset
+from datasets import Dataset, disable_caching, load_dataset, load_from_disk
 from transformers import (
     MarianMTModel, MarianTokenizer, AutoTokenizer,
     pipeline as hf_pipeline,
@@ -122,7 +122,7 @@ def paraphrase(text, num_return_sequences: int = 3) -> list[str]:
     # print(outs)
     return [out["generated_text"].strip() for out in outs]
 
-def paraphrase_batch(batch: dict, num_return_sequences: int = 1, paraph_per_seed: int = 2) -> dict:
+def paraphrase_batch(batch: dict, num_return_sequences: int = 1, paraph_per_seed: int = 3) -> dict:
     """
     Return a dictionary with paraphrased texts for each text in the batch.
     """
@@ -142,8 +142,8 @@ def paraphrase_batch(batch: dict, num_return_sequences: int = 1, paraph_per_seed
 def generate_synthetic_for_intents(
     train_ds, 
     id2label, 
-    k: int = 5,
-    paraph_per_seed: int = 2
+    k: int = 10,
+    paraph_per_seed: int = 3
 ) -> dict:
     """
     Generate synthetic examples for a given intent using paraphrasing.
@@ -163,7 +163,7 @@ def generate_synthetic_for_intents(
 
     # Extract intents
     intents = [
-        id2label(ex["intent"]) for ex in train_ds for _ in range(paraph_per_seed)
+        ex["labels"] for ex in train_ds for _ in range(paraph_per_seed)
     ]
 
     # Return paraphrases and intents
@@ -216,20 +216,24 @@ def augment_dataset_with_paraphrasing(train_ds, id2label, label_names, output_pa
     # tokenized = Dataset.from_list(tokenized['input_ids'])
     # tokenized.save_to_disk(output_paugment_dataset_with_btranslationath)
 
+    paraphrases_ds = paraphrases_ds.rename_column("intents", "labels")
+    paraphrases_ds = paraphrases_ds.rename_column("paraphrases", "text")
+    # Convert the intent column from string labels to integer IDs
+
     return paraphrases_ds
 
 
-def augment_dataset_with_synonyms(train_ds, num_syn_repl=1, output_path="./synonyms_aug_dataset"):
-    id2label = train_ds.features["intent"].int2str
+def augment_dataset_with_synonyms(train_ds, num_syn_repl=5, output_path="./synonyms_aug_dataset"):
+    id2label = train_ds.features["labels"].int2str
     augmented_texts = []
     augmented_labels = []
     # We assume the original batch still has a "text" field.
     print("Generating synonyms dataset...")
-    for text, label in zip(train_ds["text"], train_ds["intent"]):
+    for text, label in zip(train_ds["text"], train_ds["labels"]):
         # Apply synonym replacement
         synonyms_text = synonym_replacement(text, n=num_syn_repl)
         augmented_texts.append(synonyms_text)
-        augmented_labels.append(id2label(label))
+        augmented_labels.append(label)
     syn_ds = Dataset.from_dict({"text": augmented_texts, "labels": augmented_labels})
     syn_ds.save_to_disk(output_path)
     print("Synonym replacements dataset saved.")
@@ -238,8 +242,7 @@ def augment_dataset_with_synonyms(train_ds, num_syn_repl=1, output_path="./synon
 
 def augment_dataset_with_btranslation(train_ds, id2label, num_bt=2, output_path="./backtranslation_aug_dataset"):
     # id2label = train_ds.features["intent"].int2str
-    augmented_texts = []
-    augmented_labels = []
+
     bt_ds = train_ds.map(back_translate_batch, batched=True, batch_size=128)
     # Save the back-translated dataset to disk
     os.makedirs(output_path, exist_ok=True)
@@ -251,23 +254,20 @@ def augment_dataset_with_btranslation(train_ds, id2label, num_bt=2, output_path=
     # bt_ds = bt_ds.map(lambda x: {"intent": id2label(x["intent"])}, batched=False)
 
     # Extract intents
-    intents = [
-        id2label(ex) for ex in bt_ds["intent"]
+    labels = [
+        ex for ex in bt_ds["labels"]
     ]
 
-    bt_ds = Dataset.from_dict({"text": bt_ds["text"], "intents": intents})
+    bt_ds = Dataset.from_dict({"text": bt_ds["text"], "labels": labels})
     bt_ds.save_to_disk(output_path)
 
+    return bt_ds
 
-def load_combine_datasets(par_output_path="./paraphrase_aug_dataset", 
-                     syn_output_path="./synonyms_aug_dataset", 
-                     bt_output_path="./backtranslation_aug_dataset"):
+def save_load_combine_tokenize_datasets():
     
-    # Load the datasets from disk
-    par_ds = Dataset.load_from_disk(par_output_path)
-    syn_ds = Dataset.load_from_disk(syn_output_path)
-    bt_ds = Dataset.load_from_disk(bt_output_path)
-
+    # Load the CLINC150 dataset from Hugging Face (this will download the data_full version)
+    # The clinc_data object is a DatasetDict or Dataset containing all 23,700 samples in CLINC150. The dataset includes a column for the user utterance text, an intent label (e.g. "banking:balance"), a broader domain label, and a split indicator. The data is divided into training, validation, and test splits, with out-of-scope examples separated as well (e.g., "oos_train", "oos_test" for out-of-scope queries). 
+    
     clinc_data = load_dataset("contemmcm/clinc150", "full")
     print(clinc_data)
 
@@ -277,15 +277,131 @@ def load_combine_datasets(par_output_path="./paraphrase_aug_dataset",
     else:
         full_dataset = clinc_data                  # Handle case where directly a Dataset is returned
 
+    unique_intents = full_dataset.features["intent"].names
+    id2label = full_dataset.features["intent"].int2str
+
     # Separate into training, validation, and test sets, including out-of-scope (oos) examples
-    train_ds = full_dataset.filter(lambda ex: ex["split"] in ["train", "oos_train"])
+    train_dataset = full_dataset.filter(lambda ex: ex["split"] in ["train", "oos_train"])
+    val_dataset   = full_dataset.filter(lambda ex: ex["split"] in ["val", "oos_val"])
+    test_dataset  = full_dataset.filter(lambda ex: ex["split"] in ["test", "oos_test"])
+    # Debug
+    # train_dataset = train_dataset.shuffle().select(range(1000))  # For quick testing
+
+    # train_ds_str_intent = train_dataset.map(lambda x: {"intent": id2label(x["intent"])})  # Rename column to 'text'
 
     # Rename the intent column to 'labels' for compatibility with the model training API
-    par_ds = par_ds.rename_column("paraphrases", "text")
-    par_ds = par_ds.rename_column("intents", "intent")
-    bt_ds = bt_ds.rename_column("intents", "intent")
-    syn_ds = syn_ds.rename_column("labels", "intent")
-    # train_ds = train_ds.rename_column("intents", "intent")
+    train_dataset = train_dataset.rename_column("intent", "labels")
+    # Extract the ClassLabel feature from the original dataset
+    label_feature = train_dataset.features["labels"]
+
+    # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
+    train_dataset = train_dataset.remove_columns(["domain", "split"])
+
+    # Set formats for PyTorch (so that __getitem__ returns torch.Tensor)
+    # train_dataset.set_format("torch")
+
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
+    # Expect ~15100 train (15000 in-scope + 100 oos), 3100 val (3000 + 100), 5500 test (4500 + 1000)
+
+    print("Preparing augmented dataset...")
+
+    # Get the list of intent label names (for later use in decoding predictions)
+    label_names = full_dataset.features["intent"].names  # list of 151 intent labels (e.g., "banking:balance", "oos:oos", etc.)
+    print(label_names)
+
+    combined_augmented_dataset_path = "./combined_dataset"
+    backtranslation_aug_dataset_path = "./backtranslation_aug_dataset"
+    paraphrase_aug_dataset_path = "./paraphrase_aug_dataset"
+    synonyms_aug_dataset_path = "./synonyms_aug_dataset"
+
+    combined_ds, bt_ds, par_ds, syn_ds = [], [], [], []
+    if os.path.exists(combined_augmented_dataset_path):
+        print("Loading augmented dataset from file...")
+        combined_ds = load_from_disk(combined_augmented_dataset_path)
+        print(f"Loaded {len(combined_ds)} samples from augmented dataset.")
+    else:
+        if os.path.exists(backtranslation_aug_dataset_path):
+            print("Loading backtranslation augmented dataset from file...")
+            bt_ds = load_from_disk(backtranslation_aug_dataset_path)
+            print(f"Loaded {len(bt_ds)} samples from backtranslation augmented dataset.")
+        else:
+            print("Augmenting dataset with back translations...")
+            bt_ds = augment_dataset_with_btranslation(train_dataset, id2label)
+            print("Back translation dataset created.")
+        if os.path.exists(paraphrase_aug_dataset_path):
+            print("Loading paraphrase augmented dataset from file...")
+            par_ds = load_from_disk(paraphrase_aug_dataset_path)
+            print(f"Loaded {len(par_ds)} samples from paraphrase augmented dataset.") 
+        else:
+            print("Augmenting dataset with paraphrasing...")
+            par_ds = augment_dataset_with_paraphrasing(
+                train_dataset,
+                id2label,
+                label_names=full_dataset.features["intent"].names,
+            )
+            print("Paraphrasing dataset created.")
+        if os.path.exists(synonyms_aug_dataset_path):
+            print("Loading synonyms augmented dataset from file...")
+            syn_ds = load_from_disk(synonyms_aug_dataset_path)
+            print(f"Loaded {len(syn_ds)} samples from synonyms augmented dataset.")
+        else:
+            syn_ds = augment_dataset_with_synonyms(train_dataset, num_syn_repl=4)
+
+    if combined_ds == []:
+         # Rename the intent column to 'labels' for compatibility with the model training API
+        # par_ds = par_ds.rename_column("paraphrases", "text")
+        # par_ds = par_ds.rename_column("intents", "labels")
+        # bt_ds = bt_ds.rename_column("intents", "intent")
+        # syn_ds = syn_ds.rename_column("labels", "intent")
+        # syn_ds = syn_ds.rename_column("intent", "labels")
+        # train_ds = train_ds.rename_column("intents", "intent")
+        # Cast the labels column in the augmented datasets
+        bt_ds = bt_ds.cast_column("labels", label_feature)
+        par_ds = par_ds.cast_column("labels", label_feature)
+        syn_ds = syn_ds.cast_column("labels", label_feature)
+        combined_ds = concatenate_datasets([train_dataset, bt_ds, par_ds, syn_ds])
+        # Save the combined dataset to disk
+        if not os.path.exists(combined_augmented_dataset_path):
+            os.makedirs(combined_augmented_dataset_path, exist_ok=True)
+            print("Saved combined dataset to file...")
+            combined_ds.save_to_disk(combined_augmented_dataset_path)
+       
+
+    from transformers import AutoTokenizer
+
+    # Initialize BERT tokenizer (uncased means text will be lowercased)
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    # tokenizer.pad_token = tokenizer.eos_token
+    #  # tell the tokenizer what its max context really is
+    # tokenizer.model_max_length = config["n_positions"]
+
+    # Tokenization function to process text examples
+    def tokenize_batch(batch):
+        return tokenizer(batch['text'], padding="max_length", truncation=True, max_length=64)
+        # max_length=64 should cover most queries; adjust if needed (max utterance length in CLINC150 is relatively short)
+
+    # Apply tokenization to each split of the dataset
+    # train_dataset = train_dataset.map(tokenize_batch, batched=True)
+    val_dataset   = val_dataset.map(tokenize_batch, batched=True)
+    test_dataset  = test_dataset.map(tokenize_batch, batched=True)
+
+    # Rename the intent column to 'labels' for compatibility with the model training API
+    # train_dataset = train_dataset.rename_column("intent", "labels")
+    val_dataset   = val_dataset.rename_column("intent", "labels")
+    test_dataset  = test_dataset.rename_column("intent", "labels")
+
+    # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
+    # train_dataset = train_dataset.remove_columns(["text", "domain", "split"])
+    val_dataset   = val_dataset.remove_columns(["text", "domain", "split"])
+    test_dataset  = test_dataset.remove_columns(["text", "domain", "split"])
+
+    # Set formats for PyTorch (so that __getitem__ returns torch.Tensor)
+    # train_dataset.set_format("torch")
+    val_dataset.set_format("torch")
+    test_dataset.set_format("torch")
+
+    # Separate into training, validation, and test sets, including out-of-scope (oos) examples
+    train_ds = full_dataset.filter(lambda ex: ex["split"] in ["train", "oos_train"])
 
     # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
     # bt_ds = bt_ds.remove_columns(["domain", "split"])
@@ -298,54 +414,39 @@ def load_combine_datasets(par_output_path="./paraphrase_aug_dataset",
     ]
     train_ds = Dataset.from_dict({"text": train_ds["text"], "intent": intent})
 
-    # Combine the datasets
-    combined_ds = concatenate_datasets([train_ds, par_ds, syn_ds, bt_ds])
+    # Apply tokenization to the Combined dataset
+    tokenized_train_ds_text = combined_ds.map(tokenize_batch, batched=True)
+    # tokenized_train_ds_text.set_format("torch")
+    tokenized_train_ds_text = tokenized_train_ds_text.map(
+        lambda x: {"input_ids": x["input_ids"], "attention_mask": x["attention_mask"]}
+    )
 
-    return combined_ds
+    # Ensure labels are integers
+    # if "labels" not in augmented_train_ds.column_names:
+    #     label2id = {label: i for i, label in enumerate(label_names)}
+    #     augmented_train_ds = augmented_train_ds.map(
+    #         lambda x: {"labels": label2id[x["intent"]]}
+    #     )
 
-def save_tokenized_augmented_dataset(train_ds, id2label, label_names, num_syn_repl=1, num_bt=1, num_synth=3, output_path="./tokenized_augmented_dataset"):
-    """
-    Save the augmented dataset to disk after applying augmentation pipelines.
-    """
-    # Paraphrase the dataset
-    augmented_ds = augment_dataset_with_paraphrasing(train_ds, id2label, label_names, num_syn_repl=num_syn_repl, num_bt=num_bt)
-    syn_ds = augment_dataset_with_synonyms(train_ds, num_syn_repl=2)
-    print("Paraphrasing dataset created.")
-    # Tokenize the augmented dataset
-    # If augmented_ds is a dict, convert it to a Dataset
-    if isinstance(augmented_ds, dict):
-        augmented_ds = Dataset.from_dict(augmented_ds)
+    # # Extract the labels column
+    # labels = augmented_train_ds["labels"]
 
-    tokenized_augmented_ds = augmented_ds.map(tokenize_batch, batched=True, batch_size=1024)
-    tokenized_augmented_ds.set_format("torch")
-    tokenized_train_ds = train_ds.map(tokenize_batch, batched=True, batch_size=1024)
+    # TOKENIZE THE TRAINING DATASET
+
+    # Create the dataset
+    tokenized_train_ds = Dataset.from_dict({
+        "input_ids": tokenized_train_ds_text["input_ids"],
+        "attention_mask": tokenized_train_ds_text["attention_mask"],
+        "labels": tokenized_train_ds_text["labels"],
+    })
     tokenized_train_ds.set_format("torch")
-    # Combine the original and augmented datasets
-    combined_ds = concatenate_datasets([train_ds, augmented_ds])
+    # tokenized_train_ds = tokenized_train_ds.rename_column("intent", "labels")
 
-    # Synonym replacements
-    augmented_ds = augment_dataset_with_synonyms(train_ds, num_syn_repl=2)
-    print("Synonym replacements dataset created.")
-    # Tokenize the augmented dataset
-    if isinstance(augmented_ds, dict):
-        augmented_ds = Dataset.from_dict(augmented_ds)
-    tokenized_augmented_ds = augmented_ds.map(tokenize_batch, batched=True, batch_size=1024)
-    tokenized_augmented_ds.set_format("torch")
-    # Combine the original and augmented datasets
-    combined_ds = concatenate_datasets([combined_ds, augmented_ds])
-
-    # Back-translation
-    augmented_ds = augment_dataset_with_btranslation(train_ds, num_bt=2)
-    print("Back-translation dataset created.")
-    tokenized_augmented_ds = augmented_ds.map(tokenize_batch, batched=True, batch_size=1024)
-    tokenized_augmented_ds.set_format("torch")
-    # Combine the original and augmented datasets
-    combined_ds = concatenate_datasets([combined_ds, augmented_ds])
-    
-    # Save the combined dataset to disk
-    os.makedirs(output_path, exist_ok=True)
-    print("Saving augmented dataset to file...")
-    combined_ds.save_to_disk(output_path)
-    return combined_ds
+    # tokenize the augmented dataset
+    # augmented_train = load_from_disk(augmented_dataset_path)
 
 
+    # # tokenize the augmented dataset
+    # tok_aug_train = augmented_train.map(tokenize_batch, batched=True)
+
+    return combined_ds, full_dataset, train_dataset, val_dataset, test_dataset, tokenized_train_ds, tokenizer
