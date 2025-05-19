@@ -1,9 +1,9 @@
-
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset
 import os
 from transformers.trainer_utils import get_last_checkpoint
-from augmentation import save_augmented_dataset
+from augmentation import save_tokenized_augmented_dataset, augment_dataset_with_paraphrasing, augment_dataset_with_synonyms, augment_dataset_with_btranslation, load_combine_datasets
+
 
 # Load the CLINC150 dataset from Hugging Face (this will download the data_full version)
 # The clinc_data object is a DatasetDict or Dataset containing all 23,700 samples in CLINC150. The dataset includes a column for the user utterance text, an intent label (e.g. "banking:balance"), a broader domain label, and a split indicator. The data is divided into training, validation, and test splits, with out-of-scope examples separated as well (e.g., "oos_train", "oos_test" for out-of-scope queries). 
@@ -16,14 +16,51 @@ if "complete" in clinc_data:
 else:
     full_dataset = clinc_data                  # Handle case where directly a Dataset is returned
 
+unique_intents = full_dataset.features["intent"].names
+id2label = full_dataset.features["intent"].int2str
+
 # Separate into training, validation, and test sets, including out-of-scope (oos) examples
 train_dataset = full_dataset.filter(lambda ex: ex["split"] in ["train", "oos_train"])
 val_dataset   = full_dataset.filter(lambda ex: ex["split"] in ["val", "oos_val"])
 test_dataset  = full_dataset.filter(lambda ex: ex["split"] in ["test", "oos_test"])
+# Debug
+# train_dataset = train_dataset.shuffle().select(range(1000))  # For quick testing
+
+# train_ds_str_intent = train_dataset.map(lambda x: {"intent": id2label(x["intent"])})  # Rename column to 'text'
 
 print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
 # Expect ~15100 train (15000 in-scope + 100 oos), 3100 val (3000 + 100), 5500 test (4500 + 1000)
 
+print("Preparing augmented dataset...")
+
+# Get the list of intent label names (for later use in decoding predictions)
+label_names = full_dataset.features["intent"].names  # list of 151 intent labels (e.g., "banking:balance", "oos:oos", etc.)
+print(label_names)
+
+augmented_dataset_path = "./tokenize_augmented_dataset"
+
+if os.path.exists(augmented_dataset_path):
+    print("Loading augmented dataset from file...")
+    augmented_train = load_from_disk(augmented_dataset_path)
+    print(f"Loaded {len(augmented_train)} samples from augmented dataset.")
+else:
+    print("Augmenting dataset with paraphrasing...")
+    para_augmented_train = augment_dataset_with_paraphrasing(
+        train_dataset,
+        id2label,
+        label_names=full_dataset.features["intent"].names,
+    )
+    print("Augmenting dataset with synonyms...")
+    syn_ds = augment_dataset_with_synonyms(train_dataset, num_syn_repl=2)
+    print("Paraphrasing dataset created.")
+    print("Augmenting dataset with back translations...")
+    syn_ds = augment_dataset_with_btranslation(train_dataset, id2label)
+    print("Back translation dataset created.")
+
+# The augment_dataset function will return a new dataset with augmented samples
+# Print the number of samples in the augmented training set
+print(para_augmented_train)
+print(f"Augmented Train samples with paraphrasing with length: {len(para_augmented_train)}")
 
 from transformers import AutoTokenizer
 
@@ -45,23 +82,6 @@ train_dataset = train_dataset.rename_column("intent", "labels")
 val_dataset   = val_dataset.rename_column("intent", "labels")
 test_dataset  = test_dataset.rename_column("intent", "labels")
 
-print("Preparing augmented dataset...")
-augmented_dataset_path = "./augmented_train_dataset"
-
-if os.path.exists(augmented_dataset_path):
-    print("Loading augmented dataset from file...")
-    augmented_train = load_from_disk(augmented_dataset_path)
-else:
-    print("Augmenting dataset...")
-    augmented_train = save_augmented_dataset(train_dataset,
-                                      num_syn_repl=1,
-                                      num_bt=1,
-                                      num_synth=3,
-                                      output_path=augmented_dataset_path)
-# The augment_dataset function will return a new dataset with augmented samples
-# Print the number of samples in the augmented training set
-print(f"Augmented Train samples: {len(augmented_train)}")
-
 # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
 train_dataset = train_dataset.remove_columns(["text", "domain", "split"])
 val_dataset   = val_dataset.remove_columns(["text", "domain", "split"])
@@ -72,10 +92,42 @@ train_dataset.set_format("torch")
 val_dataset.set_format("torch")
 test_dataset.set_format("torch")
 
+# Load combined datasets
+augmented_train_ds = load_combine_datasets()
+augmented_train_ds.set_format("torch")
 
-# Get the list of intent label names (for later use in decoding predictions)
-label_names = full_dataset.features["intent"].names  # list of 151 intent labels (e.g., "banking:balance", "oos:oos", etc.)
-print(label_names)
+tokenized_train_ds_text = augmented_train_ds.map(tokenize_batch, batched=True)
+# tokenized_train_ds_text.set_format("torch")
+tokenized_train_ds_text = tokenized_train_ds_text.map(
+    lambda x: {"input_ids": x["input_ids"].tolist(), "attention_mask": x["attention_mask"].tolist()}
+)
+
+# Ensure labels are integers
+if "labels" not in augmented_train_ds.column_names:
+    label2id = {label: i for i, label in enumerate(label_names)}
+    augmented_train_ds = augmented_train_ds.map(
+        lambda x: {"labels": label2id[x["intent"]]}
+    )
+
+# Extract the labels column
+labels = augmented_train_ds["labels"]
+
+# Create the dataset
+tokenized_train_ds = Dataset.from_dict({
+    "input_ids": tokenized_train_ds_text["input_ids"],
+    "attention_mask": tokenized_train_ds_text["attention_mask"],
+    "labels": labels
+})
+tokenized_train_ds.set_format("torch")
+# tokenized_train_ds = tokenized_train_ds.rename_column("intent", "labels")
+
+# tokenize the augmented dataset
+# augmented_train = load_from_disk(augmented_dataset_path)
+
+
+# # tokenize the augmented dataset
+# tok_aug_train = augmented_train.map(tokenize_batch, batched=True)
+
 
 from transformers import AutoModelForSequenceClassification
 
@@ -122,13 +174,17 @@ def compute_metrics(eval_pred):
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=augmented_train,  # use the augmented training dataset
+    train_dataset=tokenized_train_ds,  # use the augmented training dataset
     eval_dataset=val_dataset,             # validation set for evaluation
     tokenizer=tokenizer,                  # tokenizer is passed to enable automatic padding in the collator
     compute_metrics=compute_metrics       # function to compute metrics
 )
 
-trainer.train(get_last_checkpoint(training_args.output_dir))  # start training
+# trainer.train(get_last_checkpoint(training_args.output_dir))  # start training
+trainer.train()  # start training
+# Evaluate the model on the validation set
+val_metrics = trainer.evaluate(val_dataset)
+print("Validation Set Performance:", val_metrics)   
 # Save the fine-tuned model
 # trainer.save_model("./intent_model")  # save the model to the specified directory
 
@@ -280,7 +336,7 @@ while True:
         break
     # The following number were chose by analyzing the ROC curve and the energy score distributions
     pred_intent = predict_intent_with_oos(example_query, 0.18, -5.9, 1.0)
-    # pred_intent = predict_intent_with_oos(example_query, tau_prob, tau_energy, 1.1)
+    # pred_intent = predict_intent_with_oos(example_query, tau_prob, tau_energy, 1.0)
     print(f"Query: '{example_query}'")
     print(f"Predicted Intent: {pred_intent}")
 
