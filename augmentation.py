@@ -24,7 +24,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 nltk.download('wordnet')
 nltk.download('omw-1.4')
 
-def synonym_replacement(sentence: str, n: int = 2) -> str:
+def synonym_replacement(sentence: str, n: int = 6) -> str:
     """
     Replace up to `n` words in `sentence` with a random WordNet synonym.
     """
@@ -59,31 +59,47 @@ mt_en_es_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-es")
 mt_es_en_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-es-en")
 mt_es_en_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en").to(device)
 
-def back_translate_batch(batch):
+def back_translate_batch(batch, number_of_translations: int = 1):
     # English → Spanish
     en_es_tok = mt_en_es_tokenizer(batch["text"], return_tensors="pt", truncation=True, max_length=64, padding=True)
     en_es_tok = {k: v.to(device) for k, v in en_es_tok.items()}  # Move tensors to the correct device
-    # batch = {k: v.to(device) for k, v in batch.items()}
+    
     with torch.no_grad():
-        en_es_translated = mt_en_es_model.generate(**en_es_tok, num_beams=3, max_length=64)
+        en_es_translated = mt_en_es_model.generate(
+            **en_es_tok, 
+            num_beams=number_of_translations, 
+            num_return_sequences=number_of_translations, 
+            max_length=64
+        )
+    
     # Decode the translated text
     es_texts = mt_en_es_tokenizer.batch_decode(en_es_translated, skip_special_tokens=True)
-    es = mt_en_es_tokenizer.batch_decode(en_es_translated, skip_special_tokens=True)[0]
-    # Spanish → English
+    
     # Spanish → English
     es_en_tok = mt_es_en_tokenizer(
         es_texts, 
         return_tensors="pt", 
         truncation=True, 
-        padding=True,  # Add padding here as well
+        padding=True, 
         max_length=64
     )
-    es_en_tok = {k: v.to(device) for k, v in es_en_tok.items()}  # Move tensors to the correct devic
-    # batch_rev = {k: v.to(device) for k, v in batch_rev.items()}
+    es_en_tok = {k: v.to(device) for k, v in es_en_tok.items()}  # Move tensors to the correct device
+    
     with torch.no_grad():
-        en_es_translated = mt_es_en_model.generate(**es_en_tok, num_beams=3, max_length=64)
+        es_en_translated = mt_es_en_model.generate(
+            **es_en_tok, 
+            num_beams=number_of_translations, 
+            num_return_sequences=number_of_translations, 
+            max_length=64
+        )
+    
     # Decode the back-translated text
-    en_texts = mt_es_en_tokenizer.batch_decode(en_es_translated, skip_special_tokens=True)
+    en_texts = mt_es_en_tokenizer.batch_decode(es_en_translated, skip_special_tokens=True)
+    
+    # Group translations for each input
+    # grouped_translations = []
+    # for i in range(0, len(en_texts), number_of_translations):
+    #     grouped_translations.append(en_texts[i:i + number_of_translations].join(""))
     
     # Return a dictionary with the updated "text" column
     return {"text": en_texts}
@@ -108,7 +124,7 @@ paraphraser = pipeline(
 )
 
 # ─── 1. Paraphrase helper ─────────────────────────────────────────────────────
-def paraphrase(text, num_return_sequences: int = 3) -> list[str]:
+def paraphrase(text, num_return_sequences: int = 1) -> list[str]:
     """Return up to `num_return_sequences` paraphrases of `text`."""
     # prompts = []
     # for text in texts:
@@ -122,14 +138,14 @@ def paraphrase(text, num_return_sequences: int = 3) -> list[str]:
     # print(outs)
     return [out["generated_text"].strip() for out in outs]
 
-def paraphrase_batch(batch: dict, num_return_sequences: int = 1, paraph_per_seed: int = 3) -> dict:
+def paraphrase_batch(batch: dict, num_return_sequences: int = 1, paraph_per_seed: int = 1) -> dict:
     """
     Return a dictionary with paraphrased texts for each text in the batch.
     """
     # Prepare prompts for all texts in the batch
     prompts = [f"paraphrase: {text} </s>" for text in batch["text"] for _ in range(paraph_per_seed)]
     # outs = paraphraser(prompts, num_beams = 3, num_return_sequences=num_return_sequences, batch_size=128)
-    outs = paraphraser(prompts, num_beams = 3, batch_size=128)
+    outs = paraphraser(prompts, num_beams = 1, batch_size=128)
 
     # Extract the generated_text values from the output
     paraphrased_texts = [x["generated_text"].strip() for x in outs]
@@ -143,7 +159,7 @@ def generate_synthetic_for_intents(
     train_ds, 
     id2label, 
     k: int = 10,
-    paraph_per_seed: int = 3
+    paraph_per_seed: int = 1
 ) -> dict:
     """
     Generate synthetic examples for a given intent using paraphrasing.
@@ -156,7 +172,7 @@ def generate_synthetic_for_intents(
 
     # Apply paraphrasing in batches
     paras_samples = samples.map(
-        lambda batch: paraphrase_batch(batch, num_return_sequences=paraph_per_seed),
+        lambda batch: paraphrase_batch(batch, paraph_per_seed = 1),
         batched=True,
         batch_size=128
     )
@@ -209,15 +225,16 @@ def augment_dataset_with_paraphrasing(train_ds, id2label, label_names, output_pa
     print("Paraphrasing dataset created.")
 
     paraphrases_ds = Dataset.from_dict(synth_options)
-    # Save the combined dataset to disk
-    os.makedirs(output_path, exist_ok=True)
-    print("Saving augmented dataset to file...")
-    paraphrases_ds.save_to_disk(output_path)
     # tokenized = Dataset.from_list(tokenized['input_ids'])
     # tokenized.save_to_disk(output_paugment_dataset_with_btranslationath)
 
     paraphrases_ds = paraphrases_ds.rename_column("intents", "labels")
     paraphrases_ds = paraphrases_ds.rename_column("paraphrases", "text")
+
+    # Save the combined dataset to disk
+    os.makedirs(output_path, exist_ok=True)
+    print("Saving augmented dataset to file...")
+    paraphrases_ds.save_to_disk(output_path)
     # Convert the intent column from string labels to integer IDs
 
     return paraphrases_ds
@@ -291,11 +308,13 @@ def save_load_combine_tokenize_datasets():
 
     # Rename the intent column to 'labels' for compatibility with the model training API
     train_dataset = train_dataset.rename_column("intent", "labels")
-    # Extract the ClassLabel feature from the original dataset
-    label_feature = train_dataset.features["labels"]
+    # train_dataset = train_dataset.rename_column("paraphrases", "text")
 
     # We can remove other columns we won't use (like 'text', 'domain', 'split') to keep dataset lean
     train_dataset = train_dataset.remove_columns(["domain", "split"])
+
+    # Extract the ClassLabel feature from the original dataset
+    label_feature = train_dataset.features["labels"]
 
     # Set formats for PyTorch (so that __getitem__ returns torch.Tensor)
     # train_dataset.set_format("torch")
@@ -345,7 +364,7 @@ def save_load_combine_tokenize_datasets():
             syn_ds = load_from_disk(synonyms_aug_dataset_path)
             print(f"Loaded {len(syn_ds)} samples from synonyms augmented dataset.")
         else:
-            syn_ds = augment_dataset_with_synonyms(train_dataset, num_syn_repl=4)
+            syn_ds = augment_dataset_with_synonyms(train_dataset, num_syn_repl=1)
 
     if combined_ds == []:
          # Rename the intent column to 'labels' for compatibility with the model training API
@@ -360,13 +379,15 @@ def save_load_combine_tokenize_datasets():
         par_ds = par_ds.cast_column("labels", label_feature)
         syn_ds = syn_ds.cast_column("labels", label_feature)
         combined_ds = concatenate_datasets([train_dataset, bt_ds, par_ds, syn_ds])
+        # combined_ds = train_dataset
         # Save the combined dataset to disk
         if not os.path.exists(combined_augmented_dataset_path):
             os.makedirs(combined_augmented_dataset_path, exist_ok=True)
             print("Saved combined dataset to file...")
             combined_ds.save_to_disk(combined_augmented_dataset_path)
        
-
+    # # DEBUG NO AUGMENTATION
+    # combined_ds = train_dataset
     from transformers import AutoTokenizer
 
     # Initialize BERT tokenizer (uncased means text will be lowercased)
