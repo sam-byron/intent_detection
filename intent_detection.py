@@ -9,7 +9,7 @@ model_name = "bert-large-uncased-whole-word-masking"
 
 # ─── Load the datasets ──────────────────────────────────────────────────────
 # Load the CLINC150 dataset
-combined_ds, full_dataset, train_dataset, val_dataset, test_dataset, oos_ds, tokenizer = save_load_combine_tokenize_datasets()
+combined_ds, combined_oos_ds, full_dataset, train_dataset, val_dataset, test_dataset, oos_ds, tokenizer = save_load_combine_tokenize_datasets()
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -32,6 +32,7 @@ tokenized_train_ds = train_dataset.map(tokenize_batch, batched=True)
 
 tokenized_test_dataset  = test_dataset.map(tokenize_batch, batched=True)
 tokenized_combined_ds = combined_ds.map(tokenize_batch, batched=True)
+tokenized_combined_oos_ds = combined_oos_ds.map(tokenize_batch, batched=True)
 tokenized_oos_ds = oos_ds.map(tokenize_batch, batched=True)
 
 
@@ -45,15 +46,18 @@ if os.path.exists(model_dir) and get_last_checkpoint(model_dir) is not None:
     print(f"Loading model from {get_last_checkpoint(model_dir)}")
     model = AutoModelForSequenceClassification.from_pretrained(
         get_last_checkpoint(model_dir),
-        hidden_dropout_prob=0.3,
-        attention_probs_dropout_prob=0.2,
-        classifier_dropout=0.2
+        hidden_dropout_prob=0.2,
+        attention_probs_dropout_prob=0.1,
+        classifier_dropout=0.1
     )
 else:
     print("Loading pretrained BERT model")
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=num_intents
+        num_labels=num_intents,
+        hidden_dropout_prob=0.2,
+        attention_probs_dropout_prob=0.1,
+        classifier_dropout=0.1
     )
 
 # Set model's label mappings (useful for inference or saving the model)
@@ -78,19 +82,14 @@ training_args = TrainingArguments(
     learning_rate=2e-5,                # a typical fine-tuning learning rate for BERT
     # learning_rate=2e-6,
     eval_strategy="steps",       # evaluate on the validation set each epoch
-    eval_steps = 1000,
+    eval_steps = 250,
     # evaluate_during_training=True,    # evaluate during training
     save_strategy="steps",             # save model each epoch
     save_steps=1000,                   # save model every 1000 steps
     load_best_model_at_end=True,       # load best model (according to eval metric) at end of training
     metric_for_best_model="accuracy",  # use accuracy to pick best model (could use f1 as well)
-    logging_steps=250,                  # log training progress every 50 steps
+    logging_steps=100,                  # log training progress every 50 steps
     logging_dir="./logs",  
-    # ↑ weight decay to penalize large weights more heavily
-    weight_decay=0.05,                    
-    # ↑ label smoothing to avoid overconfident predictions
-    label_smoothing_factor=0.1,                 # directory for logs
-    # seed=42,                            # for reproducibility
 )
 
 import numpy as np
@@ -106,11 +105,14 @@ def compute_metrics(eval_pred):
 trainer = Trainer(
     model=model,
     args=training_args,
+    # train_dataset=toekenized_train_ds,  # use the augmented training dataset
     train_dataset=tokenized_combined_ds,  # use the augmented training dataset
-    eval_dataset=val_dataset,             # validation set for evaluation
+    eval_dataset=tokenized_val_dataset,             # validation set for evaluation
     tokenizer=tokenizer,                  # tokenizer is passed to enable automatic padding in the collator
-    compute_metrics=compute_metrics       # function to compute metrics
+    compute_metrics=compute_metrics,       # function to compute metrics,
+    # Chose loss function for bert
 )
+trainer.train()  # start training
 
 # trainer.train(get_last_checkpoint(training_args.output_dir))  # start training
 if os.path.exists(model_dir) and False:
@@ -130,16 +132,41 @@ if os.path.exists(model_dir) and False:
 # Fine tune on oos dataset
 # # Combine train_ds and oos_ds
 oos_train_ds = {"text": [], "labels": []}
-oos_train_ds["text"] = tokenized_train_ds["text"] + tokenized_oos_ds["text"]
-oos_train_ds["labels"] = tokenized_train_ds["labels"] + tokenized_oos_ds["labels"]
+oos_train_ds["text"] = train_dataset["text"] + oos_ds["text"]
+oos_train_ds["labels"] = train_dataset["labels"] + oos_ds["labels"]
 oos_train_ds = Dataset.from_dict(oos_train_ds)
 tok_oos_train_ds = oos_train_ds.map(tokenize_batch, batched=True)
+
+
+training_args = TrainingArguments(
+    output_dir=model_dir,       # output directory for model checkpoints and logs
+    overwrite_output_dir=False,
+    num_train_epochs=2,                # let's fine-tune for 3 epochs (adjustable)
+    per_device_train_batch_size=96,    # batch size for training
+    per_device_eval_batch_size=96,     # batch size for evaluation
+    learning_rate=2e-6,                # a typical fine-tuning learning rate for BERT
+    # learning_rate=2e-6,
+    eval_strategy="steps",       # evaluate on the validation set each epoch
+    eval_steps = 250,
+    # evaluate_during_training=True,    # evaluate during training
+    save_strategy="steps",             # save model each epoch
+    save_steps=1000,                   # save model every 1000 steps
+    load_best_model_at_end=True,       # load best model (according to eval metric) at end of training
+    metric_for_best_model="accuracy",  # use accuracy to pick best model (could use f1 as well)
+    logging_steps=100,                  # log training progress every 50 steps
+    logging_dir="./logs",  
+    # ↑ weight decay to penalize large weights more heavily
+    weight_decay=0.05,                    
+    # ↑ label smoothing to avoid overconfident predictions
+    label_smoothing_factor=0.1,                 # directory for logs
+    # seed=42,                            # for reproducibility
+)
 
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tok_oos_train_ds,  # use the augmented training dataset
-    eval_dataset=val_dataset,             # validation set for evaluation
+    train_dataset=tokenized_combined_oos_ds,  # use the augmented training dataset
+    eval_dataset=tokenized_val_dataset,             # validation set for evaluation
     tokenizer=tokenizer,                  # tokenizer is passed to enable automatic padding in the collator
     compute_metrics=compute_metrics       # function to compute metrics
 )
@@ -147,7 +174,7 @@ trainer.train()  # start training
 
 # tau_prob, tau_energy = calibrate_oos_thresholds_roc(
 #     trainer,
-#     val_dataset,
+#     tokenized_val_dataset,
 #     oos_label_name="oos:oos",
 #     T=1.0,
 #     plot=True       # toggle to see the histograms
@@ -163,7 +190,7 @@ tau_prob, tau_energy = calibrate_oos_thresholds_roc(
 
 # tau_prob, tau_energy = calibrate_oos_thresholds_roc(
 #     trainer,
-#     tokenized_combined_ds,
+#     tokenized_combined_oos_ds,
 #     oos_label_name="oos:oos",
 #     T=1.0,
 #     plot=True       # toggle to see the histograms
@@ -171,7 +198,7 @@ tau_prob, tau_energy = calibrate_oos_thresholds_roc(
 
 # tau_prob, tau_energy = calibrate_oos_thresholds_roc(
 #     trainer,
-#     tokenized_train_dataset,
+#     tokenized_train_ds,
 #     oos_label_name="oos:oos",
 #     T=1.0,
 #     plot=True       # toggle to see the histograms
@@ -181,20 +208,17 @@ print(f"tau_prob: {tau_prob}, tau_energy: {tau_energy}")
 # The following number were chose by analyzing the ROC curve and the energy score distributions
 
 # Interactive loop for intent prediction
-# while True:
-#     example_query = input("Enter a query (or type 'exit' to quit): ")
-#     if example_query.lower() == "exit":
-#         print("Exiting...")
-#         break
-#     # The following number were chose by analyzing the ROC curve and the energy score distributions
-#     # pred_intent = predict_intent_with_oos(example_query, 0.18, -5.9, tokenizer,
-#     # model,
-#     # device)
-#     pred_intent = predict_intent_with_oos(example_query, tau_prob, tau_energy, tokenizer,
-#     model,
-#     device)
-#     print(f"Query: '{example_query}'")
-#     print(f"Predicted Intent: {pred_intent}")
+while True:
+    example_query = input("Enter a query (or type 'exit' to quit): ")
+    if example_query.lower() == "exit":
+        print("Exiting...")
+        break
+    # The following number were chose by analyzing the ROC curve and the energy score distributions
+    pred_intent = predict_intent_with_oos(example_query, tau_prob, tau_energy, tokenizer,
+    model,
+    device)
+    print(f"Query: '{example_query}'")
+    print(f"Predicted Intent: {pred_intent}")
 
 # Take the number of samples as input
 num_samples = int(input("Enter the number of sample queries to test: "))

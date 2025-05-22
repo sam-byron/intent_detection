@@ -105,7 +105,7 @@ def predict_intent_with_oos(
     tokenizer,
     model,
     device,
-    T: float = 2.0
+    T: float = 1.0
 ) -> dict:
     """
     Tokenize `text`, run the model, and:

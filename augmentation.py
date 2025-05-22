@@ -138,8 +138,8 @@ def generate_paraphrases(train_ds):
 
     # Process the dataset in smaller chunks manually
     paras_samples = {"paraphrases": [], "intents": []}
-    for i in tqdm(range(0, len(train_ds), 64), desc="Generating paraphrases"):
-        batch = train_ds[i:i + 64]  # Get a batch of 64 samples
+    for i in tqdm(range(0, len(train_ds), 16), desc="Generating paraphrases"):
+        batch = train_ds[i:i + 16]  # Get a batch of 64 samples
         paraphrased_batch = paraphrase(batch)  # Generate paraphrases
         paras_samples["paraphrases"].extend(paraphrased_batch["paraphrases"])
         paras_samples["intents"].extend(paraphrased_batch["intents"])
@@ -154,9 +154,6 @@ def generate_paraphrases(train_ds):
 # (e.g., BERT, RoBERTa, etc.)
 # This should match the model you will use for training.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-def tokenize_batch(batch):
-    return tokenizer(batch, padding="max_length", truncation=True, max_length=64)
 
 
 def augment_dataset_with_paraphrasing(train_ds, output_path="./paraphrase_aug_dataset"):
@@ -192,7 +189,7 @@ def augment_dataset_with_paraphrasing(train_ds, output_path="./paraphrase_aug_da
 nltk.download('wordnet')
 nltk.download('omw-1.4')
 
-def synonym_replacement(sentence: str, iter = 10, n: int = 6) -> str:
+def synonym_replacement(sentence: str, iter = 5, n: int = 3) -> str:
     """
     Replace up to `n` words in `sentence` with a random WordNet synonym.
     """
@@ -249,7 +246,8 @@ mt_es_en_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-es-en
 mt_es_en_model     = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en").to(device)
 
 
-def back_translate_batch(batch, number_of_translations: int = 10):
+def back_translate_batch(batch, number_of_translations: int = 2):
+
     # English → Spanish
     en_es_tok = mt_en_es_tokenizer(batch["text"], return_tensors="pt", truncation=True, max_length=64, padding=True)
     en_es_tok = {k: v.to(device) for k, v in en_es_tok.items()}  # Move tensors to the correct device
@@ -302,7 +300,8 @@ def back_translate_batch(batch, number_of_translations: int = 10):
 def augment_dataset_with_btranslation(train_ds, output_path="./backtranslation_aug_dataset"):
     # id2label = train_ds.features["intent"].int2str
 
-    bt_ds = train_ds.map(back_translate_batch, batched=True, batch_size=128)
+    bt_ds = "reload"
+    bt_ds = train_ds.map(back_translate_batch, batched=True, batch_size=96)
     # Save the back-translated dataset to disk
     os.makedirs(output_path, exist_ok=True)
     print("Saving back-translated dataset to file...")
@@ -313,29 +312,27 @@ def augment_dataset_with_btranslation(train_ds, output_path="./backtranslation_a
 
     return bt_ds
 
-def augment_dataset_with_oos(oos_ds, train_ds, output_path="./oos_aug_dataset"):
+def augment_dataset_with_oos(oos_ds, output_path="./oos_aug_dataset"):
     # Pick all OOS examples from the original dataset
     # oos_ds = ds.filter(lambda ex: ex["split"] in ["oos_train"])
     # Paraphrase the OOS examples
     par_oos_ds = augment_dataset_with_paraphrasing(oos_ds, output_path=output_path)
-    # Combine train_ds and oos_ds
-    tok_oos_train_ds = {"text": [], "labels": []}
-    tok_oos_train_ds["text"] = par_oos_ds["text"] + train_ds["text"]
-    tok_oos_train_ds["labels"] = par_oos_ds["labels"] + train_ds["labels"]
     
-
-    return Dataset.from_dict(tok_oos_train_ds)
+    return par_oos_ds
 
 def save_load_combine_tokenize_datasets():
 
     combined_augmented_dataset_path = "./combined_dataset"
+    combined_oos_augmented_dataset_path = "./combined_oos_dataset"
     backtranslation_aug_dataset_path = "./backtranslation_aug_dataset"
     paraphrase_aug_dataset_path = "./paraphrase_aug_dataset"
     synonyms_aug_dataset_path = "./synonyms_aug_dataset"
     oos_aug_dataset_path = "./oos_aug_dataset"
 
-    combined_ds, bt_ds, par_ds, syn_ds, oos_ds = [], [], [], [], []
+    combined_ds, combined_oos_ds, bt_ds, par_ds, syn_ds, oos_ds = [], [], [], [], [], []
     train_on_ds = train_ios_ds
+    # train_on_ds2 = train_ios_ds
+
     # train_on_ds = train_dataset
     
     if os.path.exists(backtranslation_aug_dataset_path):
@@ -371,28 +368,39 @@ def save_load_combine_tokenize_datasets():
     else:
         print("Augmenting dataset with oos...")
         # oos_ds = augment_dataset_with_oos(oos_train_dataset, train_dataset)
-        oos_ds = augment_dataset_with_oos(oos_train_dataset, combined_ds)
+        oos_ds = augment_dataset_with_oos(oos_train_dataset)
         print("oos dataset created.")
     
+    # Cast the labels column in the augmented datasets
+    bt_ds = bt_ds.cast_column("labels", label_feature)
+    par_ds = par_ds.cast_column("labels", label_feature)
+    syn_ds = syn_ds.cast_column("labels", label_feature)
+    oos_ds = oos_ds.cast_column("labels", label_feature)
+    train_on_ds = train_on_ds.cast_column("labels", label_feature)
     if os.path.exists(combined_augmented_dataset_path):
         print("Loading augmented dataset from file...")
         with multiprocessing.Pool(cpu_count()-10) as pool:
             combined_ds = pool.apply(load_from_disk, args=(combined_augmented_dataset_path,))
         print(f"Loaded {len(combined_ds)} samples from augmented dataset.")
     else:
-        # Cast the labels column in the augmented datasets
-        bt_ds = bt_ds.cast_column("labels", label_feature)
-        par_ds = par_ds.cast_column("labels", label_feature)
-        syn_ds = syn_ds.cast_column("labels", label_feature)
         combined_ds = concatenate_datasets([train_on_ds, bt_ds, par_ds, syn_ds])
-        # combined_ds = concatenate_datasets([train_dataset, par_ds, syn_ds])
-        # combined_ds = train_dataset
         # Save the combined dataset to disk
         if not os.path.exists(combined_augmented_dataset_path):
             os.makedirs(combined_augmented_dataset_path, exist_ok=True)
             print("Saved combined dataset to file...")
-            combined_ds.save_to_disk(combined_augmented_dataset_path)
+            combined_oos_ds.save_to_disk(combined_augmented_dataset_path)
 
 
-    
-    return combined_ds, full_dataset, train_dataset, val_dataset, test_dataset, oos_ds, tokenizer
+    if os.path.exists(combined_oos_augmented_dataset_path):
+        print("Loading augmented dataset from file...")
+        with multiprocessing.Pool(cpu_count()-10) as pool:
+            combined_oos_ds = pool.apply(load_from_disk, args=(combined_oos_augmented_dataset_path,))
+        print(f"Loaded {len(combined_oos_ds)} samples from augmented dataset.")
+    else:
+        combined_oos_ds = concatenate_datasets([train_on_ds, bt_ds, par_ds, syn_ds, oos_ds])
+        # Save the combined dataset to disk
+        os.makedirs(combined_oos_augmented_dataset_path, exist_ok=True)
+        print("Saved combined dataset to file...")
+        combined_oos_ds.save_to_disk(combined_oos_augmented_dataset_path)
+
+    return combined_ds, combined_oos_ds, full_dataset, train_dataset, val_dataset, test_dataset, oos_ds, tokenizer
