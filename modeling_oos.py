@@ -74,6 +74,9 @@ def calibrate_oos_thresholds_roc(
 
     # 6. Evaluate combined detector
     preds_oos = (max_probs < tau_prob) | (energies > tau_energy)
+    # let pred_oss be initialialized to all zeros
+    # preds_oos = np.zeros_like(preds_oos, dtype=bool)
+    
     tn, fp, fn, tp = confusion_matrix(is_oos, preds_oos).ravel()
     prec = tp / (tp + fp) if tp + fp else 0.0
     rec  = tp / (tp + fn) if tp + fn else 0.0
@@ -85,6 +88,11 @@ def calibrate_oos_thresholds_roc(
     print(f"    True OOS        as In-Scope:  FN={fn}")
     print(f"    True OOS        as OOS:       TP={tp}")
     print(f"Precision={prec:.3f}, Recall={rec:.3f}, F1={f1:.3f}")
+    # print accuracy
+    acc = (tn + tp) / (tn + fp + fn + tp)
+    print(f"Accuracy={acc:.3f}")
+    print(f"→ Combined τₚ = {tau_prob:.4f} (J={j_scores_p[best_idx_p]:.3f})")
+    print(f"→ Combined τ_E        = {tau_energy:.3f} (J={j_scores_e[best_idx_e]:.3f})")
 
     return tau_prob, tau_energy
 
@@ -94,7 +102,10 @@ def predict_intent_with_oos(
     text: str,
     tau_prob: float,
     tau_energy: float,
-    T: float = 1.0
+    tokenizer,
+    model,
+    device,
+    T: float = 2.0
 ) -> dict:
     """
     Tokenize `text`, run the model, and:
